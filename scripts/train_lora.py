@@ -1,5 +1,7 @@
 # scripts/train_lora.py
 import argparse, json, os
+import math
+import inspect
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -98,6 +100,10 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
+    # Часто рекомендуют отключать кэш во время обучения (иногда предупреждения/ошибки).
+    # На инференсе обратно включится по умолчанию.
+    model.config.use_cache = False
+
     # Target-модули типичны для Qwen/Llama-подобных блоков.
     # Если вдруг имена отличаются — можно распечатать model и подправить список.
     target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
@@ -117,14 +123,20 @@ def main():
 
     collator = FIMLineCollator(tok, max_length=args.max_length)
 
-    targs = TrainingArguments(
+    # warmup_ratio deprecated -> используем warmup_steps
+    # total_steps ~= ceil(N / (bs * grad_accum)) * epochs
+    steps_per_epoch = math.ceil(len(ds["train"]) / (args.batch_size * args.grad_accum))
+    total_steps = max(1, int(steps_per_epoch * args.epochs))
+    warmup_steps = max(1, int(0.03 * total_steps))  # эквивалент warmup_ratio=0.03
+
+    ta_params = inspect.signature(TrainingArguments.__init__).parameters
+    training_kwargs = dict(
         output_dir=args.out,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        eval_strategy="steps",
         eval_steps=200,
         save_steps=200,
         save_total_limit=3,
@@ -133,9 +145,18 @@ def main():
         fp16=False,
         report_to="none",
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=warmup_steps,
         optim="paged_adamw_8bit" if args.use_4bit else "adamw_torch",
+        remove_unused_columns=False,
     )
+
+    # transformers: evaluation_strategy (old) vs eval_strategy (new)
+    if "eval_strategy" in ta_params:
+        training_kwargs["eval_strategy"] = "steps"
+    else:
+        training_kwargs["evaluation_strategy"] = "steps"
+
+    targs = TrainingArguments(**training_kwargs)
 
     trainer = Trainer(
         model=model,
