@@ -121,6 +121,7 @@ python scripts/make_dataset.py \
   --bench_report_path data/bench_mask_report.json
 ```
 
+
 В выходных записях при `--rag_enable` добавляются поля:
 - `rag`: список фрагментов с путями и диапазонами строк,
 - `rag_query`: текст запроса,
