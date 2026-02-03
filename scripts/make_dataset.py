@@ -1,9 +1,12 @@
-# scripts/make_dataset.py
-import argparse, json, os, random, re
+import argparse
+import json
+import random
+import re
 from pathlib import Path
 from typing import Iterable, Tuple
 
 SKIP_DIRS = {".git", ".idea", "target", "build", "out", ".gradle", ".mvn"}
+
 
 def iter_java_files(repo: Path) -> Iterable[Path]:
     for p in repo.rglob("*.java"):
@@ -11,64 +14,58 @@ def iter_java_files(repo: Path) -> Iterable[Path]:
             continue
         yield p
 
+
 def extract_header(lines) -> Tuple[str, int]:
-    """
-    Возвращает (header_text, header_end_index_exclusive)
-    Header = package + непрерывный блок import (+ пустые строки между ними допускаем умеренно).
-    """
     i = 0
     header = []
-    # package
     if i < len(lines) and lines[i].lstrip().startswith("package "):
         header.append(lines[i])
         i += 1
-        # пропустим пустые строки сразу после package
         while i < len(lines) and lines[i].strip() == "":
             header.append(lines[i])
             i += 1
-    # imports block
     saw_import = False
     while i < len(lines):
         s = lines[i].lstrip()
         if s.startswith("import "):
             saw_import = True
-            header.append(lines[i]); i += 1
+            header.append(lines[i]);
+            i += 1
             continue
         if saw_import and lines[i].strip() == "":
-            # пустые строки внутри import-блока
-            header.append(lines[i]); i += 1
+            header.append(lines[i]);
+            i += 1
             continue
         break
     return ("".join(header), i)
+
 
 def good_target_line(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
-    # слишком короткие / чисто скобки — обычно неинтересно
     if len(s) < 4:
         return False
     if re.fullmatch(r"[{}();]+", s):
         return False
-    # можно отфильтровать package/import строки как таргет (опционально)
     if s.startswith("package ") or s.startswith("import "):
         return False
     return True
 
+
 def build_samples_from_file(
-    path: Path,
-    max_prefix_lines: int,
-    max_suffix_lines: int,
-    include_header: bool,
-    max_samples_per_file: int,
-    rng: random.Random,
+        path: Path,
+        max_prefix_lines: int,
+        max_suffix_lines: int,
+        include_header: bool,
+        max_samples_per_file: int,
+        rng: random.Random,
 ):
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines(keepends=True)
 
     header_text, header_end = extract_header(lines) if include_header else ("", 0)
 
-    # кандидаты: строки после header_end
     candidates = [i for i in range(header_end, len(lines)) if good_target_line(lines[i])]
     if not candidates:
         return []
@@ -86,7 +83,7 @@ def build_samples_from_file(
         suffix = "".join(after)
 
         prompt = f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"
-        completion = target  # одна строка с \n, как в исходнике (keepends=True)
+        completion = target
 
         samples.append({
             "id": f"{path.as_posix()}::{i}",
@@ -96,6 +93,7 @@ def build_samples_from_file(
             "completion": completion,
         })
     return samples
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -155,11 +153,15 @@ def main():
             for ex in samples:
                 out = val_f if rng.random() < args.val_ratio else train_f
                 out.write(json.dumps(ex, ensure_ascii=False) + "\n")
-                if out is val_f: n_val += 1
-                else: n_train += 1
+                if out is val_f:
+                    n_val += 1
+                else:
+                    n_train += 1
 
-    train_f.close(); val_f.close()
+    train_f.close();
+    val_f.close()
     print(f"Done. train={n_train}, val={n_val}")
+
 
 if __name__ == "__main__":
     main()

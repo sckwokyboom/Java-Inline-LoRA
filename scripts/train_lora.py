@@ -1,17 +1,17 @@
-# scripts/train_lora.py
-import argparse, json, os
-import math
+import argparse
 import inspect
+import math
 from dataclasses import dataclass
 from typing import Dict, List
 
 import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer,
     TrainingArguments, Trainer
 )
-from peft import LoraConfig, get_peft_model
+
 
 @dataclass
 class Batch:
@@ -19,11 +19,8 @@ class Batch:
     attention_mask: torch.Tensor
     labels: torch.Tensor
 
+
 class FIMLineCollator:
-    """
-    Токенизируем prompt и completion отдельно.
-    labels = -100 на prompt-части, loss только на completion.
-    """
     def __init__(self, tokenizer, max_length: int):
         self.tok = tokenizer
         self.max_length = max_length
@@ -40,14 +37,11 @@ class FIMLineCollator:
 
         for pi, ci in zip(p["input_ids"], c["input_ids"]):
             ids = pi + ci + eos
-            # обрезаем справа (важнее сохранить конец префикса и completion)
             if len(ids) > self.max_length:
                 overflow = len(ids) - self.max_length
-                # режем prompt сначала
                 if overflow < len(pi):
                     pi = pi[overflow:]
                 else:
-                    # если prompt слишком длинный, режем и completion тоже
                     cut = overflow - len(pi)
                     pi = []
                     ci = ci[cut:]
@@ -66,6 +60,7 @@ class FIMLineCollator:
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
 
         return {"input_ids": input_ids, "attention_mask": attn, "labels": labels}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -95,18 +90,13 @@ def main():
     if args.use_4bit:
         model_kwargs.update(dict(load_in_4bit=True, device_map="auto"))
     else:
-        # bf16 обычно ок на A100/H100/4090; на старых GPU можно fp16
         model_kwargs.update(dict(torch_dtype=torch.bfloat16, device_map="auto"))
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
-    # Часто рекомендуют отключать кэш во время обучения (иногда предупреждения/ошибки).
-    # На инференсе обратно включится по умолчанию.
     model.config.use_cache = False
 
-    # Target-модули типичны для Qwen/Llama-подобных блоков.
-    # Если вдруг имена отличаются — можно распечатать model и подправить список.
-    target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     lora_cfg = LoraConfig(
         r=args.lora_r,
@@ -123,11 +113,9 @@ def main():
 
     collator = FIMLineCollator(tok, max_length=args.max_length)
 
-    # warmup_ratio deprecated -> используем warmup_steps
-    # total_steps ~= ceil(N / (bs * grad_accum)) * epochs
     steps_per_epoch = math.ceil(len(ds["train"]) / (args.batch_size * args.grad_accum))
     total_steps = max(1, int(steps_per_epoch * args.epochs))
-    warmup_steps = max(1, int(0.03 * total_steps))  # эквивалент warmup_ratio=0.03
+    warmup_steps = max(1, int(0.03 * total_steps))
 
     ta_params = inspect.signature(TrainingArguments.__init__).parameters
     training_kwargs = dict(
@@ -150,7 +138,6 @@ def main():
         remove_unused_columns=False,
     )
 
-    # transformers: evaluation_strategy (old) vs eval_strategy (new)
     if "eval_strategy" in ta_params:
         training_kwargs["eval_strategy"] = "steps"
     else:
@@ -170,6 +157,7 @@ def main():
     model.save_pretrained(args.out)
     tok.save_pretrained(args.out)
     print("Saved adapter to:", args.out)
+
 
 if __name__ == "__main__":
     main()
