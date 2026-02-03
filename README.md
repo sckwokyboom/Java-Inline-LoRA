@@ -13,6 +13,8 @@ pip install -U "transformers>=4.41" datasets peft accelerate
 pip install bitsandbytes
 ```
 
+Примечание: для обучения используйте GPU с поддержкой bfloat16/float16; для QLoRA нужен сборка PyTorch с CUDA и bitsandbytes.
+
 ## Подготовка данных
 
 ### 1. Клонирование репозитория с данными
@@ -35,7 +37,22 @@ python scripts/make_dataset.py \
   --out_val data/val.jsonl
 ```
 
+Формат записей JSONL: поля `prompt` (FIM-контекст с `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`) и `completion` (строки, которые надо предсказать). Лосс считается только по `completion`.
+
 ## Обучение модели
+
+Быстрый тест без сохранения артефактов (строит модель+датасет, делает пару проходов вперёд и печатает VRAM):
+
+```bash
+python scripts/train_lora.py \
+  --model Qwen/Qwen2.5-Coder-3B \
+  --train data/train.jsonl \
+  --val data/val.jsonl \
+  --out adapters/debug \
+  --dry_run
+```
+
+Стандартное обучение LoRA (bf16/auto, градиентный чекпойнтинг включён по умолчанию):
 
 ```bash
 python scripts/train_lora.py \
@@ -46,8 +63,36 @@ python scripts/train_lora.py \
   --max_length 2048 \
   --epochs 1 \
   --batch_size 2 \
-  --grad_accum 16
+  --grad_accum 16 \
+  --lr 2e-4 \
+  --warmup_ratio 0.03
 ```
+
+QLoRA (4-bit), при наличии bitsandbytes:
+
+```bash
+python scripts/train_lora.py \
+  --model Qwen/Qwen2.5-Coder-3B \
+  --train data/train.jsonl \
+  --val data/val.jsonl \
+  --out adapters/chatgpt4j-qwen25coder3b-qlora \
+  --use_4bit \
+  --max_length 2048 \
+  --epochs 1 \
+  --batch_size 1 \
+  --grad_accum 16 \
+  --lr 2e-4
+```
+
+Полезные флаги:
+- `--dtype {auto,bf16,fp16}` — выбор типа (по умолчанию auto → bf16 если доступен).
+- `--tf32` — включить TF32 на Ampere+.
+- `--gradient_checkpointing/--no-gradient_checkpointing` — управление чекпойнтингом.
+- `--warmup_steps` или `--warmup_ratio` — тёплый старт, ratio конвертируется в шаги.
+- `--eval_steps/--save_steps/--logging_steps` — интервалы логов/оценки/сохранений.
+- `--dry_run` — быстрая проверка без сохранений.
+
+Артефакты сохраняются в `--out`: LoRA-адаптер, токенизатор и `run_config.json` (параметры запуска + рассчитанные величины).
 
 ## Подсчёт статистик по RepoEval
 
@@ -76,4 +121,3 @@ Java-Inline-LoRA/
     ├── make_dataset.py    # Скрипт для создания датасета
     └── train_lora.py      # Скрипт для обучения LoRA
 ```
-
