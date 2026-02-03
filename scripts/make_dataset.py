@@ -8,6 +8,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import rag_retrieval
+
 SKIP_DIRS = {".git", ".idea", "target", "build", "out", ".gradle", ".mvn"}
 PROMPT_CONTEXT_LINES = 10
 FUZZY_THRESHOLD = 0.9
@@ -322,6 +324,8 @@ def build_samples_from_file(
         text_blocklist_by_file: Optional[Dict[str, Set[str]]] = None,
         global_text_blocklist: Optional[Set[str]] = None,
         exclusion_counter: Optional[Dict[str, int]] = None,
+        rag_retriever: Optional[rag_retrieval.RagRetriever] = None,
+        rag_insert_location: str = "prefix_head",
 ):
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines(keepends=True)
@@ -365,16 +369,33 @@ def build_samples_from_file(
         prefix = header_text + "".join(before)
         suffix = "".join(after)
 
+        rag_meta = {}
+        if rag_retriever:
+            rag_block, rag_list, rag_query = rag_retriever.retrieve(rel_path, i, before, after, target)
+            if rag_block:
+                if rag_insert_location == "prefix_tail":
+                    prefix = prefix + rag_block
+                else:
+                    prefix = rag_block + prefix
+                rag_meta = {
+                    "rag": rag_list,
+                    "rag_query": rag_query,
+                    "rag_k_used": len(rag_list),
+                }
+
         prompt = f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"
         completion = target
 
-        samples.append({
+        sample = {
             "id": f"{path.as_posix()}::{i}",
             "file": path.as_posix(),
             "line_index": i,
             "prompt": prompt,
             "completion": completion,
-        })
+        }
+        if rag_meta:
+            sample.update(rag_meta)
+        samples.append(sample)
     return samples
 
 
@@ -447,6 +468,27 @@ def parse_args():
     ap.add_argument("--no-bench_global_text_blocklist", action="store_false", dest="bench_global_text_blocklist", help="Disable global text blocklisting from benchmark lines")
     ap.add_argument("--leak_policy", choices=["exclude_only", "downweight_files"], default="exclude_only")
     ap.add_argument("--bench_downweight_factor", type=float, default=0.25, help="Sampling multiplier for benchmark-referenced files when leak_policy=downweight_files")
+    ap.add_argument("--rag_enable", action="store_true", help="Enable retrieval-augmented context insertion")
+    ap.add_argument("--rag_k", type=int, default=4, help="Number of retrieved snippets per sample")
+    ap.add_argument("--rag_max_chars", type=int, default=2000, help="Character budget for retrieval section")
+    ap.add_argument("--rag_max_snippet_chars", type=int, default=600, help="Per-snippet character cap")
+    ap.add_argument("--rag_method", choices=["bm25"], default="bm25")
+    ap.add_argument("--rag_chunker", choices=["lines", "treesitter"], default="lines")
+    ap.add_argument("--rag_chunk_lines", type=int, default=30)
+    ap.add_argument("--rag_chunk_overlap", type=int, default=10)
+    ap.add_argument("--rag_query_mode", choices=["masked_window", "ast_symbols", "hybrid"], default="hybrid")
+    ap.add_argument("--rag_query_window_lines", type=int, default=20)
+    ap.add_argument("--rag_drop_stopwords", action="store_true", default=True)
+    ap.add_argument("--no-rag_drop_stopwords", dest="rag_drop_stopwords", action="store_false")
+    ap.add_argument("--rag_use_identifiers_only", action="store_true", help="Keep only identifier-like tokens when building queries")
+    ap.add_argument("--rag_exclude_same_file_window", type=int, default=80, help="Do not retrieve from same file within this line window")
+    ap.add_argument("--rag_exclude_bench_targets", action="store_true", default=True, help="Filter retrieval that overlaps benchmark-masked lines")
+    ap.add_argument("--no-rag_exclude_bench_targets", dest="rag_exclude_bench_targets", action="store_false")
+    ap.add_argument("--rag_exclude_completion_text", action="store_true", default=True, help="Filter retrieval containing the completion line text")
+    ap.add_argument("--no-rag_exclude_completion_text", dest="rag_exclude_completion_text", action="store_false")
+    ap.add_argument("--rag_insert_location", choices=["prefix_head", "prefix_tail"], default="prefix_head")
+    ap.add_argument("--rag_format", choices=["comment_block"], default="comment_block")
+    ap.add_argument("--rag_cache_dir", help="Optional cache directory for retrieval index")
     return ap.parse_args()
 
 
@@ -474,6 +516,34 @@ def main():
         global_blocklist = set()
         referenced_files = set()
         bench_report = None
+
+    retriever = None
+    if args.rag_enable:
+        if args.rag_format != "comment_block":
+            raise SystemExit("Only comment_block RAG format is supported")
+        retriever = rag_retrieval.RagRetriever(
+            repo=repo,
+            files=files,
+            k=args.rag_k,
+            max_chars=args.rag_max_chars,
+            max_snippet_chars=args.rag_max_snippet_chars,
+            method=args.rag_method,
+            chunker=args.rag_chunker,
+            chunk_lines=args.rag_chunk_lines,
+            chunk_overlap=args.rag_chunk_overlap,
+            query_mode=args.rag_query_mode,
+            query_window_lines=args.rag_query_window_lines,
+            drop_stopwords=args.rag_drop_stopwords,
+            use_identifiers_only=args.rag_use_identifiers_only,
+            exclude_same_file_window=args.rag_exclude_same_file_window,
+            exclude_completion_text=args.rag_exclude_completion_text,
+            exclude_bench_targets=args.rag_exclude_bench_targets,
+            excluded_by_file=excluded_by_file if args.rag_exclude_bench_targets else {},
+            text_blocklist_by_file=text_blocklist_by_file if args.rag_exclude_bench_targets else {},
+            global_text_blocklist=global_blocklist if (args.rag_exclude_bench_targets and args.bench_global_text_blocklist) else set(),
+        )
+        if args.rag_cache_dir:
+            print("[rag] cache_dir provided but persistence is not implemented; using in-memory index")
 
     Path(args.out_train).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_val).parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +574,8 @@ def main():
             text_blocklist_by_file=text_blocklist_by_file,
             global_text_blocklist=global_blocklist if args.bench_global_text_blocklist else None,
             exclusion_counter=exclusion_counter,
+            rag_retriever=retriever if args.rag_enable else None,
+            rag_insert_location=args.rag_insert_location,
         )
         if not samples:
             continue
@@ -530,6 +602,10 @@ def main():
     train_f.close()
     val_f.close()
 
+    rag_report_data = retriever.report() if retriever else None
+    if rag_report_data:
+        print(f"[rag] exclusion counts: {json.dumps(rag_report_data, sort_keys=True)}")
+
     if bench_paths:
         bench_report = bench_report or {}
         bench_report.update({
@@ -537,6 +613,8 @@ def main():
             "bench_file_sample_counts": dict(per_bench_file_sample_count),
             "bench_paths": [p.as_posix() for p in bench_paths],
         })
+        if rag_report_data:
+            bench_report["rag_exclusions"] = rag_report_data
         report_path = Path(args.bench_report_path)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(bench_report, indent=2), encoding="utf-8")
