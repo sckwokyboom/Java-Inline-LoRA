@@ -1,0 +1,29 @@
+[project]
+name = "java-inline-lora"
+version = "0.1.0"
+description = "LoRA training + dataset generation for Java inline completion (FIM)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.46,<5.0",
+    "datasets>=2.19,<3.0",
+    "accelerate>=0.33,<1.0",
+    "peft>=0.12,<1.0",
+    "safetensors>=0.4.3",
+    "tokenizers>=0.19",
+    "tiktoken>=0.7.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "matplotlib"
+]
+
+[project.optional-dependencies]
+qlora = [
+    "bitsandbytes>=0.43.0; platform_system == 'Linux'",
+]
+
+[tool.setuptools]
+py-modules = []

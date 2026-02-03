@@ -49,6 +49,20 @@ python scripts/train_lora.py \
   --grad_accum 16
 ```
 
+## Подсчёт статистик по RepoEval
+
+### Анализ всех тестовых файлов в директории
+
+```bash
+python scripts/repoeval_stats.py data/repoeval --pattern "*.test.jsonl"
+```
+
+### Анализ конкретных файлов с созданием графиков
+
+```bash
+python repoeval_stats.py api_level.java.test.jsonl live_level.java.test.jsonl --plots-dir ./reporeval_plots
+```
+
 ## Структура проекта
 
 ```
