@@ -91,6 +91,36 @@ python scripts/make_dataset.py \
   --bench_report_path data/bench_mask_report.json
 ```
 
+Пример с политикой downweight для бенчмарков (снижает вес файлов из bench_dir в 4 раза):
+
+```bash
+python scripts/make_dataset.py \
+  --repo ./data/repos/chatgpt4j \
+  --bench_dir ./data/repoeval_samples \
+  --include_header \
+  --split_by_file \
+  --max_prefix_lines 80 \
+  --max_suffix_lines 80 \
+  --max_samples_per_file 30 \
+  --out_train data/train_rag.jsonl \
+  --out_val data/val_rag.jsonl \
+  --rag_enable \
+  --rag_k 2 \
+  --rag_max_chars 1000 \
+  --rag_max_snippet_chars 500 \
+  --rag_chunker lines \
+  --rag_chunk_lines 30 \
+  --rag_chunk_overlap 10 \
+  --rag_query_mode hybrid \
+  --rag_query_window_lines 20 \
+  --rag_exclude_same_file_window 120 \
+  --rag_exclude_bench_targets \
+  --rag_exclude_completion_text \
+  --leak_policy downweight_files \
+  --bench_downweight_factor 0.25 \
+  --bench_report_path data/bench_mask_report.json
+```
+
 В выходных записях при `--rag_enable` добавляются поля:
 - `rag`: список фрагментов с путями и диапазонами строк,
 - `rag_query`: текст запроса,
