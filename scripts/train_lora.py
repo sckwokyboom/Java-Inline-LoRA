@@ -446,15 +446,22 @@ def main():
         print("Dry run complete; exiting without saving.")
         return
 
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=training_args,
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
         data_collator=collator,
-        tokenizer=tokenizer,
         callbacks=[FirstStepMemoryCallback(_log_memory)],
     )
+
+    sig = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in sig:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in sig:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.train()
     _log_memory()
