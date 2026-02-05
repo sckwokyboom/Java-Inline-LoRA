@@ -15,7 +15,7 @@ import os
 import time
 from collections import defaultdict
 from functools import lru_cache
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, List, Tuple
 
 from transformers import AutoTokenizer
 
@@ -43,6 +43,8 @@ DROP_REASONS = {
     "hit_file_sep_max_iters": "hit_file_sep_max_iters",
     "hit_max_tokenize_calls_per_example": "hit_max_tokenize_calls_per_example",
     "skipped_file_sep_pass_due_to_char_len": "skipped_file_sep_pass_due_to_char_len",
+    "rag_variant_requires_truncation": "rag_variant_requires_truncation",
+    "both_mode_conflict_skip": "both_mode_conflict_skip",
 }
 
 
@@ -181,6 +183,29 @@ def _parse_args():
         help="Drop or truncate examples that exceed tokenizer.model_max_length.",
     )
     ap.add_argument(
+        "--emit_both_rag_and_norag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Emit both No-RAG and RAG variants for each example when possible.",
+    )
+    ap.add_argument(
+        "--both_mode_suffixes",
+        default="norag,rag",
+        help="Comma-separated variant suffixes to tag No-RAG and RAG outputs.",
+    )
+    ap.add_argument(
+        "--both_mode_on_conflict",
+        choices=["skip", "keep_one"],
+        default="keep_one",
+        help="When only one variant succeeds, either keep it or skip both.",
+    )
+    ap.add_argument(
+        "--both_mode_require_truncation_for_rag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require truncation flags to be set for emitting the RAG variant.",
+    )
+    ap.add_argument(
         "--report_path",
         default=None,
         help="Optional JSON path to write conversion report (supersedes --truncate_report_path).",
@@ -286,6 +311,15 @@ class TokenLenHelper:
 def _init_split_stats() -> Dict:
     return {
         "total_seen": 0,
+        "originals_seen": 0,
+        "originals_emitted_2": 0,
+        "originals_emitted_1": 0,
+        "originals_emitted_0": 0,
+        "variants_emitted_total": 0,
+        "norag_emitted": 0,
+        "rag_emitted": 0,
+        "variant_emitted_counts": defaultdict(int),
+        "drop_reasons_by_variant": defaultdict(lambda: defaultdict(int)),
         "kept": 0,
         "truncated": 0,
         "stripped": 0,
@@ -317,6 +351,15 @@ def _merge_global_stats(per_split: Dict[str, Dict]) -> Dict:
     merged = _init_split_stats()
     for split_stats in per_split.values():
         merged["total_seen"] += split_stats["total_seen"]
+        merged["originals_seen"] += split_stats["originals_seen"]
+        merged["originals_emitted_2"] += split_stats["originals_emitted_2"]
+        merged["originals_emitted_1"] += split_stats["originals_emitted_1"]
+        merged["originals_emitted_0"] += split_stats["originals_emitted_0"]
+        merged["variants_emitted_total"] += split_stats["variants_emitted_total"]
+        merged["norag_emitted"] += split_stats["norag_emitted"]
+        merged["rag_emitted"] += split_stats["rag_emitted"]
+        for variant, count in split_stats["variant_emitted_counts"].items():
+            merged["variant_emitted_counts"][variant] += count
         merged["kept"] += split_stats["kept"]
         merged["truncated"] += split_stats["truncated"]
         merged["stripped"] += split_stats["stripped"]
@@ -343,6 +386,9 @@ def _merge_global_stats(per_split: Dict[str, Dict]) -> Dict:
         ]
         for k, v in split_stats["drop_reasons"].items():
             merged["drop_reasons"][k] += v
+        for variant, reasons in split_stats["drop_reasons_by_variant"].items():
+            for reason, count in reasons.items():
+                merged["drop_reasons_by_variant"][variant][reason] += count
         for k, v in split_stats["safeguards"].items():
             merged["safeguards"][k] += v
         for k, v in split_stats["timing"].items():
@@ -353,6 +399,12 @@ def _merge_global_stats(per_split: Dict[str, Dict]) -> Dict:
 def _log(msg: str, level: str, log_level: str):
     if LOG_LEVELS[log_level] >= LOG_LEVELS[level]:
         print(msg)
+
+
+def _record_drop_reason(stats: Dict, reason: str, variant: str | None = None):
+    stats["drop_reasons"][reason] += 1
+    if variant is not None:
+        stats["drop_reasons_by_variant"][variant][reason] += 1
 
 
 def _strip_file_sep_blocks(
@@ -529,106 +581,162 @@ def _process_split(
     start_time = time.perf_counter()
     eos_len = 1 if tokenizer.eos_token_id is not None else 0
 
-    for idx, ex in enumerate(examples, start=1):
-        token_helper.reset_example()
+    if args.emit_both_rag_and_norag:
+        norag_label, rag_label = args.both_mode_suffixes_list
+        variant_configs: List[Dict] = [
+            {
+                "name": norag_label,
+                "role": "norag",
+                "apply_strip": True,
+                "strip_mode": "remove_all_pairs",
+                "require_truncation": False,
+            },
+            {
+                "name": rag_label,
+                "role": "rag",
+                "apply_strip": False,
+                "strip_mode": args.strip_file_sep_mode,
+                "require_truncation": args.both_mode_require_truncation_for_rag,
+            },
+        ]
+    else:
+        variant_configs = [
+            {
+                "name": "single",
+                "role": "single",
+                "apply_strip": args.strip_to_pure_fim,
+                "strip_mode": args.strip_file_sep_mode,
+                "require_truncation": False,
+            }
+        ]
+
+    def _finalize_variant_result(res: Dict, emit: bool):
         stats["total_seen"] += 1
-        prompt = ex.get("prompt")
-        completion = ex.get("completion")
-        original_prompt = prompt
-
-        if not isinstance(prompt, str) or not isinstance(completion, str):
-            stats["drop_reasons"][DROP_REASONS["missing_required_fields"]] += 1
-            stats["dropped"] += 1
-            continue
-
-        try:
-            completion_tokens = token_helper.token_len(completion)
-        except TokenizeLimitError:
-            stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
-            if args.drop_on_safeguard_hit:
-                stats["drop_reasons"][DROP_REASONS["hit_max_tokenize_calls_per_example"]] += 1
-                stats["dropped"] += 1
-                continue
-            processed.append(ex)
-            stats["kept"] += 1
-            stats["tokenize_calls"] += token_helper.example_calls
-            continue
-
-        stats["completion_tokens_sum"] += completion_tokens
-        stats["completion_tokens_max"] = max(stats["completion_tokens_max"], completion_tokens)
-        if completion_tokens < args.min_completion_tokens:
-            stats["drop_reasons"][DROP_REASONS["min_completion_tokens"]] += 1
-            stats["dropped"] += 1
-            stats["tokenize_calls"] += token_helper.example_calls
-            continue
-
-        try:
-            prompt_tokens = token_helper.token_len(prompt)
-        except TokenizeLimitError:
-            stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
-            if args.drop_on_safeguard_hit:
-                stats["drop_reasons"][DROP_REASONS["hit_max_tokenize_calls_per_example"]] += 1
-                stats["dropped"] += 1
-                continue
-            processed.append(ex)
-            stats["kept"] += 1
-            stats["tokenize_calls"] += token_helper.example_calls
-            continue
-
-        stats["prompt_tokens_sum_before"] += prompt_tokens
-        stats["prompt_tokens_max_before"] = max(stats["prompt_tokens_max_before"], prompt_tokens)
-
-        model_max_hit = False
-        if model_max_length is not None and prompt_tokens > model_max_length:
+        stats["tokenize_calls"] += res.get("token_calls", 0)
+        completion_tokens = res.get("completion_tokens")
+        if completion_tokens is not None:
+            stats["completion_tokens_sum"] += completion_tokens
+            stats["completion_tokens_max"] = max(stats["completion_tokens_max"], completion_tokens)
+        if res.get("prompt_tokens_before") is not None:
+            stats["prompt_tokens_sum_before"] += res["prompt_tokens_before"]
+            stats["prompt_tokens_max_before"] = max(
+                stats["prompt_tokens_max_before"], res["prompt_tokens_before"]
+            )
+        if res.get("model_max_hit"):
             stats["prompt_tokens_over_model_max"] += 1
-            model_max_hit = True
+        if res.get("prompt_tokens_over_budget"):
+            stats["examples_with_prompt_tokens_over_budget"] += 1
+        if res.get("stripped"):
+            stats["stripped"] += 1
 
-        # Pure FIM strip happens before truncation.
-        if args.strip_to_pure_fim:
+        variant_name = res["name"]
+        if not emit or res.get("drop_reason"):
+            stats["dropped"] += 1
+            _record_drop_reason(
+                stats,
+                res.get("drop_reason", DROP_REASONS["both_mode_conflict_skip"]),
+                variant_name,
+            )
+            return
+
+        if res.get("prompt_tokens_after") is not None:
+            stats["prompt_tokens_sum_after"] += res["prompt_tokens_after"]
+            stats["prompt_tokens_max_after"] = max(
+                stats["prompt_tokens_max_after"], res["prompt_tokens_after"]
+            )
+        if res.get("truncated"):
+            stats["truncated"] += 1
+            stats["removed_prompt_tokens_total"] += res.get("removed_tokens") or 0
+        else:
+            stats["kept"] += 1
+
+        stats["variants_emitted_total"] += 1
+        stats["variant_emitted_counts"][variant_name] += 1
+        if res.get("role") == "norag":
+            stats["norag_emitted"] += 1
+        if res.get("role") == "rag":
+            stats["rag_emitted"] += 1
+        processed.append(res["example"])
+
+    def _attempt_variant(
+        base_prompt: str,
+        completion_tokens: int,
+        variant_cfg: Dict,
+        source_id: str,
+    ) -> Dict:
+        variant_calls_before = token_helper.example_calls
+        prompt = base_prompt
+        prompt_tokens_before = None
+        prompt_tokens_after = None
+        model_max_hit = False
+        prompt_tokens_over_budget = False
+        removed_tokens = 0
+        truncated = False
+        drop_reason = None
+        stripped = False
+
+        if variant_cfg["role"] == "rag" and variant_cfg["require_truncation"]:
+            if not args.truncate_prompt_to_max_length:
+                return {
+                    "name": variant_cfg["name"],
+                    "role": variant_cfg["role"],
+                    "drop_reason": DROP_REASONS["rag_variant_requires_truncation"],
+                    "token_calls": token_helper.example_calls - variant_calls_before,
+                    "completion_tokens": completion_tokens,
+                    "prompt_tokens_before": None,
+                    "prompt_tokens_after": None,
+                    "model_max_hit": False,
+                    "prompt_tokens_over_budget": False,
+                    "truncated": False,
+                    "removed_tokens": 0,
+                    "stripped": False,
+                }
+
+        try:
+            prompt_tokens_before = token_helper.token_len(prompt)
+        except TokenizeLimitError:
+            stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
+            if args.drop_on_safeguard_hit:
+                drop_reason = DROP_REASONS["hit_max_tokenize_calls_per_example"]
+            else:
+                prompt_tokens_before = None
+
+        if prompt_tokens_before is not None and model_max_length is not None:
+            if prompt_tokens_before > model_max_length:
+                stats["prompt_tokens_over_model_max"] += 1
+                model_max_hit = True
+
+        if variant_cfg["apply_strip"]:
+            stripped = True
             strip_start = time.perf_counter()
             try:
                 prompt, meta = _strip_file_sep_blocks(
-                    prompt, token_helper, args, mode=args.strip_file_sep_mode, stats=stats
+                    prompt, token_helper, args, mode=variant_cfg["strip_mode"], stats=stats
                 )
             except TokenizeLimitError:
                 stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
                 if args.drop_on_safeguard_hit:
-                    stats["drop_reasons"][DROP_REASONS["hit_max_tokenize_calls_per_example"]] += 1
-                    stats["dropped"] += 1
-                    stats["tokenize_calls"] += token_helper.example_calls
-                    continue
-                prompt = original_prompt
-                meta = {"hit_max_iters": False, "segments_removed": 0, "removed_tokens": 0}
+                    drop_reason = DROP_REASONS["hit_max_tokenize_calls_per_example"]
+                else:
+                    prompt = base_prompt
+                    meta = {"hit_max_iters": False, "segments_removed": 0, "removed_tokens": 0}
             stats["timing"]["file_sep_stripping_time"] += time.perf_counter() - strip_start
-            stats["stripped"] += 1
-            prompt_tokens_current = prompt_tokens
             if meta.get("hit_max_iters"):
                 if args.drop_on_safeguard_hit:
-                    stats["drop_reasons"][DROP_REASONS["hit_file_sep_max_iters"]] += 1
-                    stats["dropped"] += 1
-                    stats["tokenize_calls"] += token_helper.example_calls
-                    continue
-                prompt = original_prompt
-                prompt_tokens_current = prompt_tokens
+                    drop_reason = DROP_REASONS["hit_file_sep_max_iters"]
+                else:
+                    prompt = base_prompt
             elif isinstance(meta.get("final_len"), int):
-                prompt_tokens_current = meta["final_len"]
-            prompt_tokens = prompt_tokens_current
-            if not _fim_tokens_in_order(prompt):
-                stats["drop_reasons"][DROP_REASONS["fim_tokens_lost_after_strip"]] += 1
-                stats["dropped"] += 1
-                stats["tokenize_calls"] += token_helper.example_calls
-                continue
+                prompt_tokens_before = meta["final_len"]
+            if not drop_reason and not _fim_tokens_in_order(prompt):
+                drop_reason = DROP_REASONS["fim_tokens_lost_after_strip"]
 
-        removed_tokens = 0
-        truncated_prompt = prompt
-        drop_reason = None
-        if args.truncate_prompt_to_max_length:
-            # Compute pre-truncation budget hit count for diagnostics.
+        if drop_reason is None and args.truncate_prompt_to_max_length:
             budget = args.max_seq_length - completion_tokens - eos_len
-            if prompt_tokens > budget:
-                stats["examples_with_prompt_tokens_over_budget"] += 1
+            if prompt_tokens_before is not None and prompt_tokens_before > budget:
+                prompt_tokens_over_budget = True
             try:
-                truncated_prompt, removed_tokens, drop_reason = _truncate_prompt(
+                truncated_prompt, removed_tokens, err = _truncate_prompt(
                     prompt,
                     completion_tokens,
                     eos_len,
@@ -638,71 +746,207 @@ def _process_split(
                 )
             except TokenizeLimitError:
                 stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
-                drop_reason = DROP_REASONS["hit_max_tokenize_calls_per_example"]
+                err = DROP_REASONS["hit_max_tokenize_calls_per_example"]
 
-            if drop_reason:
+            if err:
                 safeguard_reasons = {
                     DROP_REASONS["hit_max_tokenize_calls_per_example"],
                     DROP_REASONS["hit_file_sep_max_iters"],
                 }
-                if drop_reason in safeguard_reasons and not args.drop_on_safeguard_hit:
-                    truncated_prompt = original_prompt
-                    drop_reason = None
+                if err in safeguard_reasons and not args.drop_on_safeguard_hit:
+                    truncated_prompt = base_prompt
+                    err = None
+                    removed_tokens = 0
                 else:
-                    stats["drop_reasons"][drop_reason] += 1
-                    stats["dropped"] += 1
-                    stats["tokenize_calls"] += token_helper.example_calls
-                    continue
+                    drop_reason = err
             else:
-                stats["truncated"] += 1 if removed_tokens else 0
-                stats["removed_prompt_tokens_total"] += removed_tokens or 0
+                truncated = bool(removed_tokens)
                 prompt = truncated_prompt
+                if not _fim_tokens_in_order(prompt):
+                    drop_reason = DROP_REASONS["fim_tokens_lost_after_truncation"]
 
-        if args.enforce_model_max_length and model_max_length is not None:
+        prompt_tokens_after = prompt_tokens_before
+        if drop_reason is None:
             try:
                 prompt_tokens_after = token_helper.token_len(prompt)
             except TokenizeLimitError:
                 stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
                 if args.drop_on_safeguard_hit:
-                    stats["drop_reasons"][DROP_REASONS["hit_max_tokenize_calls_per_example"]] += 1
-                    stats["dropped"] += 1
-                    stats["tokenize_calls"] += token_helper.example_calls
-                    continue
-                prompt_tokens_after = prompt_tokens
-            if prompt_tokens_after > model_max_length:
-                stats["drop_reasons"][DROP_REASONS["prompt_exceeds_model_max_length"]] += 1
-                stats["dropped"] += 1
-                stats["tokenize_calls"] += token_helper.example_calls
+                    drop_reason = DROP_REASONS["hit_max_tokenize_calls_per_example"]
+                else:
+                    prompt_tokens_after = prompt_tokens_before
+
+        if (
+            drop_reason is None
+            and args.enforce_model_max_length
+            and model_max_length is not None
+            and prompt_tokens_after is not None
+            and prompt_tokens_after > model_max_length
+        ):
+            drop_reason = DROP_REASONS["prompt_exceeds_model_max_length"]
+
+        if drop_reason is None and not _fim_tokens_in_order(prompt):
+            drop_reason = DROP_REASONS["fim_tokens_lost_after_truncation"]
+
+        variant_calls = token_helper.example_calls - variant_calls_before
+        if drop_reason is None and prompt_tokens_after is None:
+            prompt_tokens_after = prompt_tokens_before or 0
+
+        result_example = None
+        if drop_reason is None:
+            new_ex = dict(ex)
+            new_ex["prompt"] = prompt
+            new_ex["variant"] = variant_cfg["name"]
+            new_ex["source_id"] = source_id
+            new_ex["variant_id"] = f"{source_id}::{variant_cfg['name']}"
+            result_example = new_ex
+
+        return {
+            "name": variant_cfg["name"],
+            "role": variant_cfg["role"],
+            "drop_reason": drop_reason,
+            "prompt_tokens_before": prompt_tokens_before,
+            "prompt_tokens_after": prompt_tokens_after,
+            "removed_tokens": removed_tokens,
+            "truncated": truncated,
+            "model_max_hit": model_max_hit,
+            "prompt_tokens_over_budget": prompt_tokens_over_budget,
+            "token_calls": variant_calls,
+            "completion_tokens": completion_tokens,
+            "example": result_example,
+            "stripped": stripped,
+        }
+
+    for idx, ex in enumerate(examples, start=1):
+        token_helper.reset_example()
+        stats["originals_seen"] += 1
+        prompt = ex.get("prompt")
+        completion = ex.get("completion")
+        source_id = ex.get("id") or ex.get("source_id") or f"{split_name}:{idx}"
+
+        if not isinstance(prompt, str) or not isinstance(completion, str):
+            for variant_cfg in variant_configs:
+                _finalize_variant_result(
+                    {
+                        "name": variant_cfg["name"],
+                        "role": variant_cfg["role"],
+                        "drop_reason": DROP_REASONS["missing_required_fields"],
+                        "prompt_tokens_before": None,
+                        "prompt_tokens_after": None,
+                        "removed_tokens": 0,
+                        "truncated": False,
+                        "model_max_hit": False,
+                        "prompt_tokens_over_budget": False,
+                        "token_calls": token_helper.example_calls,
+                        "completion_tokens": None,
+                        "example": None,
+                        "stripped": variant_cfg["apply_strip"],
+                    },
+                    emit=False,
+                )
+            stats["originals_emitted_0"] += 1
+            continue
+
+        try:
+            completion_tokens = token_helper.token_len(completion)
+            completion_calls = token_helper.example_calls
+        except TokenizeLimitError:
+            stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
+            if args.drop_on_safeguard_hit:
+                for variant_cfg in variant_configs:
+                    _finalize_variant_result(
+                        {
+                            "name": variant_cfg["name"],
+                            "role": variant_cfg["role"],
+                            "drop_reason": DROP_REASONS["hit_max_tokenize_calls_per_example"],
+                            "prompt_tokens_before": None,
+                            "prompt_tokens_after": None,
+                            "removed_tokens": 0,
+                            "truncated": False,
+                            "model_max_hit": False,
+                            "prompt_tokens_over_budget": False,
+                            "token_calls": token_helper.example_calls,
+                            "completion_tokens": None,
+                            "example": None,
+                            "stripped": variant_cfg["apply_strip"],
+                        },
+                        emit=False,
+                    )
+                stats["originals_emitted_0"] += 1
                 continue
+            completion_tokens = None
+            completion_calls = token_helper.example_calls
+
+        stats["tokenize_calls"] += completion_calls
+
+        if completion_tokens is not None and completion_tokens < args.min_completion_tokens:
+            for variant_cfg in variant_configs:
+                _finalize_variant_result(
+                    {
+                        "name": variant_cfg["name"],
+                        "role": variant_cfg["role"],
+                        "drop_reason": DROP_REASONS["min_completion_tokens"],
+                        "prompt_tokens_before": None,
+                        "prompt_tokens_after": None,
+                        "removed_tokens": 0,
+                        "truncated": False,
+                        "model_max_hit": False,
+                        "prompt_tokens_over_budget": False,
+                        "token_calls": 0,
+                        "completion_tokens": completion_tokens,
+                        "example": None,
+                        "stripped": variant_cfg["apply_strip"],
+                    },
+                    emit=False,
+                )
+            stats["originals_emitted_0"] += 1
+            continue
+
+        variant_results = []
+        for variant_cfg in variant_configs:
+            result = _attempt_variant(prompt, completion_tokens or 0, variant_cfg, source_id)
+            variant_results.append(result)
+
+        emitted_results = []
+        failed_results = []
+        for res in variant_results:
+            if res.get("drop_reason"):
+                failed_results.append(res)
+            else:
+                emitted_results.append(res)
+
+        if args.emit_both_rag_and_norag and args.both_mode_on_conflict == "skip":
+            if emitted_results and failed_results:
+                for res in emitted_results:
+                    res["drop_reason"] = DROP_REASONS["both_mode_conflict_skip"]
+                failed_results.extend(emitted_results)
+                emitted_results = []
+
+        for res in emitted_results:
+            _finalize_variant_result(res, emit=True)
+        for res in failed_results:
+            _finalize_variant_result(res, emit=False)
+
+        emitted_count = len(emitted_results)
+        if len(variant_configs) == 1:
+            if emitted_count == 1:
+                stats["originals_emitted_1"] += 1
+            else:
+                stats["originals_emitted_0"] += 1
         else:
-            try:
-                prompt_tokens_after = token_helper.token_len(prompt)
-            except TokenizeLimitError:
-                stats["safeguards"]["hit_max_tokenize_calls_per_example"] += 1
-                if args.drop_on_safeguard_hit:
-                    stats["drop_reasons"][DROP_REASONS["hit_max_tokenize_calls_per_example"]] += 1
-                    stats["dropped"] += 1
-                    stats["tokenize_calls"] += token_helper.example_calls
-                    continue
-                prompt_tokens_after = prompt_tokens
-
-        stats["prompt_tokens_sum_after"] += prompt_tokens_after
-        stats["prompt_tokens_max_after"] = max(
-            stats["prompt_tokens_max_after"], prompt_tokens_after
-        )
-
-        new_ex = dict(ex)
-        new_ex["prompt"] = prompt
-        processed.append(new_ex)
-        stats["kept"] += 1 if not removed_tokens else 0
-        stats["tokenize_calls"] += token_helper.example_calls
+            if emitted_count == len(variant_configs):
+                stats["originals_emitted_2"] += 1
+            elif emitted_count == 1:
+                stats["originals_emitted_1"] += 1
+            else:
+                stats["originals_emitted_0"] += 1
 
         if idx % args.log_every_n == 0 and LOG_LEVELS[args.log_level] >= LOG_LEVELS["normal"]:
             elapsed = time.perf_counter() - start_time
             rate = idx / elapsed if elapsed > 0 else 0.0
             _log(
                 f"[convert] split={split_name} idx={idx}/{len(examples)} "
-                f"kept={stats['kept']} truncated={stats['truncated']} dropped={stats['dropped']} "
+                f"variants_emitted_total={stats['variants_emitted_total']} dropped={stats['dropped']} "
                 f"elapsed={elapsed:.1f}s rate={rate:.1f} ex/s",
                 "normal",
                 args.log_level,
@@ -711,11 +955,22 @@ def _process_split(
     elapsed = time.perf_counter() - start_time
     rate = stats["total_seen"] / elapsed if elapsed > 0 else 0.0
     _log(
-        f"[convert] split={split_name} done kept={stats['kept']} truncated={stats['truncated']} "
-        f"dropped={stats['dropped']} elapsed={elapsed:.1f}s rate={rate:.1f} ex/s",
+        f"[convert] split={split_name} done "
+        f"variants_emitted={stats['variants_emitted_total']} dropped={stats['dropped']} "
+        f"elapsed={elapsed:.1f}s rate={rate:.1f} ex/s",
         "normal",
         args.log_level,
     )
+    if args.emit_both_rag_and_norag:
+        _log(
+            f"[convert] split={split_name} originals={stats['originals_seen']} "
+            f"emitted_total={stats['variants_emitted_total']} "
+            f"(norag={stats['norag_emitted']} rag={stats['rag_emitted']}) "
+            f"originals:2={stats['originals_emitted_2']} "
+            f"1={stats['originals_emitted_1']} 0={stats['originals_emitted_0']}",
+            "normal",
+            args.log_level,
+        )
     return processed, stats
 
 
@@ -730,12 +985,19 @@ def _write_report(report_path: str, report: Dict):
 
 
 def _build_report(
-    per_split_stats: Dict[str, Dict], global_stats: Dict, timing: bool, include_strip: bool
+    per_split_stats: Dict[str, Dict],
+    global_stats: Dict,
+    timing: bool,
+    include_strip: bool,
+    both_mode_enabled: bool,
+    variant_suffixes: List[str],
 ) -> Dict:
     report = {"splits": {}, "global": {}}
     for split, s in per_split_stats.items():
         report["splits"][split] = _format_stats(s, timing, include_strip)
     report["global"] = _format_stats(global_stats, timing, include_strip)
+    report["both_mode_enabled"] = both_mode_enabled
+    report["variant_suffixes"] = variant_suffixes
     return report
 
 
@@ -752,12 +1014,21 @@ def _format_stats(stats: Dict, timing_enabled: bool, include_strip: bool) -> Dic
     )
 
     formatted = {
+        "originals_seen": stats["originals_seen"],
+        "originals_emitted_2": stats["originals_emitted_2"],
+        "originals_emitted_1": stats["originals_emitted_1"],
+        "originals_emitted_0": stats["originals_emitted_0"],
+        "variants_emitted_total": stats["variants_emitted_total"],
+        "norag_emitted": stats["norag_emitted"],
+        "rag_emitted": stats["rag_emitted"],
+        "variant_emitted_counts": dict(stats["variant_emitted_counts"]),
         "total_seen": stats["total_seen"],
         "kept": stats["kept"],
         "truncated": stats["truncated"],
         "stripped": stats["stripped"],
         "dropped": stats["dropped"],
         "drop_reasons": dict(stats["drop_reasons"]),
+        "drop_reasons_by_variant": {k: dict(v) for k, v in stats["drop_reasons_by_variant"].items()},
         "safeguards": stats["safeguards"],
         "tokenize_calls_total": stats["tokenize_calls"],
         "tokenize_calls_avg_per_example": avg_tokenize_calls,
@@ -782,8 +1053,12 @@ def _format_stats(stats: Dict, timing_enabled: bool, include_strip: bool) -> Dic
 def main():
     args = _parse_args()
     if args.strip_report is None:
-        args.strip_report = bool(args.strip_to_pure_fim)
+        args.strip_report = bool(args.strip_to_pure_fim or args.emit_both_rag_and_norag)
     args.max_seq_length = args.max_seq_length or args.max_length
+    suffixes = [s.strip() for s in args.both_mode_suffixes.split(",") if s.strip()]
+    if len(suffixes) != 2:
+        raise ValueError("--both_mode_suffixes must contain exactly two comma-separated values.")
+    args.both_mode_suffixes_list = suffixes
 
     seed = args.seed if args.seed is not None else DEFAULT_SEED
     _set_seed(seed)
@@ -844,7 +1119,14 @@ def main():
         _log(f"Wrote converted val split to {args.out_val}", "normal", args.log_level)
 
     if args.report_path or args.truncate_report_path:
-        report = _build_report(per_split_stats, global_stats, args.time_breakdown, args.strip_report)
+        report = _build_report(
+            per_split_stats,
+            global_stats,
+            args.time_breakdown,
+            args.strip_report,
+            args.emit_both_rag_and_norag,
+            args.both_mode_suffixes_list,
+        )
         if args.truncate_report_path:
             _write_report(args.truncate_report_path, report)
         if args.report_path:
@@ -858,6 +1140,13 @@ def main():
         f"dropped={dropped_total} "
         f"avg_tokenize_calls={global_stats['tokenize_calls'] / max(1, global_stats['total_seen']):.2f}"
     )
+    if args.emit_both_rag_and_norag:
+        summary += (
+            f" variants_emitted_total={global_stats['variants_emitted_total']} "
+            f"originals={global_stats['originals_seen']} "
+            f"2x/1x/0x=({global_stats['originals_emitted_2']}/"
+            f"{global_stats['originals_emitted_1']}/{global_stats['originals_emitted_0']})"
+        )
     _log(summary, "normal", args.log_level)
     if LOG_LEVELS[args.log_level] >= LOG_LEVELS["normal"]:
         _print_examples(processed_splits["train"], tokenizer, args.example_count, args.log_level)

@@ -78,6 +78,29 @@ python scripts/convert_dataset.py \
   --truncate_policy drop_file_sep_prefix_then_left
 ```
 
+### Training on both No-RAG and RAG prompts (doubled dataset)
+
+Конвертация успешных кейсов сразу в две выборки (чистый FIM и FIM с RAG-дополнением) — итоговый train/val может увеличиться до ~2x:
+
+```bash
+python scripts/convert_dataset.py \
+  --dataset_format fim_expected_completed \
+  --train data/train_success.jsonl \
+  --val data/val_success.jsonl \
+  --out_train data/train_doubled.jsonl \
+  --out_val data/val_doubled.jsonl \
+  --emit_both_rag_and_norag \
+  --truncate_prompt_to_max_length \
+  --max_seq_length 2048 \
+  --truncate_policy drop_file_sep_prefix_then_left \
+  --enforce_model_max_length \
+  --report_path data/convert_report_doubled.json
+```
+
+- Вариант No-RAG полностью убирает все блоки `<|file_sep|>...<|file_sep|>`.
+- Вариант RAG сохраняет `<|file_sep|>`-аугментацию, но безопасно обрезает префикс по заданному бюджету токенов, сохраняя FIM-токены.
+- Оба варианта проходят независимую валидацию длины/структуры; при конфликте обрезок либо дропается только один вариант (по умолчанию), либо оба (если `--both_mode_on_conflict skip`).
+
 ### 3. Создание датасета с RAG-контекстом (опционально)
 
 Базовый запуск с включённым RAG (retrieval вставляется в начало prefix в виде Java-комментария `/* RAG_CONTEXT ... */`):
