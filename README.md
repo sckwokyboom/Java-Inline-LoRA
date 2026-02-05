@@ -39,6 +39,37 @@ python scripts/make_dataset.py \
 
 Формат записей JSONL: поля `prompt` (FIM-контекст с `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`) и `completion` (строки, которые надо предсказать). Лосс считается только по `completion`.
 
+### 2.1. Использование готового 3-польного JSONL (prompt/expectedCode/completedCode)
+
+Если у вас есть строки вида `{"prompt": ..., "expectedCode": ..., "completedCode": ...}`, можно конвертировать их в ожидаемую схему `prompt/completion` без make_dataset.py:
+
+```bash
+python scripts/convert_dataset.py \
+  --train data/train_3fields.jsonl \
+  --val data/val_3fields.jsonl \
+  --dataset_format fim_expected_completed \
+  --out_train data/converted_train.jsonl \
+  --out_val data/converted_val.jsonl
+```
+
+Что делает команда:
+- проверяет, что `prompt`, `expectedCode`, `completedCode` — строки;
+- по умолчанию отбрасывает записи без всех FIM-токенов (`<|fim_prefix|>`, `<|fim_suffix|>`, `<|fim_middle|>`); снять проверку можно флагом `--no-require_fim_tokens`;
+- сохраняет `expectedCode` в поле `completion` (используется в лоссе), `completedCode` оставляет как метаданные (не участвует в лоссе);
+- пишет конвертированные файлы в указанные пути с `ensure_ascii=False`, китайские символы и `<|file_sep|>` сохраняются как есть.
+
+Быстрая проверка длин/токенов без записи файлов:
+
+```bash
+python scripts/convert_dataset.py \
+  --train data/train_3fields.jsonl \
+  --val data/val_3fields.jsonl \
+  --dataset_format fim_expected_completed \
+  --example_count 2 \
+  --out_train "" \
+  --out_val ""
+```
+
 ### 3. Создание датасета с RAG-контекстом (опционально)
 
 Базовый запуск с включённым RAG (retrieval вставляется в начало prefix в виде Java-комментария `/* RAG_CONTEXT ... */`):
@@ -181,6 +212,22 @@ python scripts/train_lora.py \
 - `--dry_run` — быстрая проверка без сохранений.
 
 Артефакты сохраняются в `--out`: LoRA-адаптер, токенизатор и `run_config.json` (параметры запуска + рассчитанные величины).
+
+### Пример обучения на 3-польном JSONL (prompt/expectedCode/completedCode)
+
+```bash
+python scripts/train_lora.py \
+  --model Qwen/Qwen2.5-Coder-3B \
+  --train data/train_3fields.jsonl \
+  --val data/val_3fields.jsonl \
+  --dataset_format fim_expected_completed \
+  --out adapters/chatgpt4j-qwen25coder3b-lora \
+  --max_length 2048 \
+  --epochs 1.0
+```
+
+- `expectedCode` идёт в поле `completion` и участвует в лоссе, `completedCode` остаётся только как доп. поле (не влияет на обучение).
+- По умолчанию включена проверка FIM-токенов в prompt; отключить можно `--no-require_fim_tokens`.
 
 ## Подсчёт статистик по RepoEval
 
