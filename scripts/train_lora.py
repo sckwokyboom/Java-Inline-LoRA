@@ -4,6 +4,8 @@ Train a LoRA (or QLoRA) adapter on a FIM-style JSONL dataset.
 Dataset format:
 - Each JSONL record must contain `prompt` (FIM context with <|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>)
   and `completion` (ground-truth continuation to predict).
+- Alternatively, with --dataset_format=fim_expected_completed, each record contains
+  `prompt`, `expectedCode` (used as completion), and `completedCode` (optional passthrough).
 - Loss is computed only on `completion` tokens; prompt tokens are ignored with label -100.
 
 Example commands:
@@ -34,6 +36,7 @@ from transformers import (
 )
 
 DEFAULT_SEED = 42
+FIM_TOKENS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
 
 
 def _safe_is_bf16_supported() -> bool:
@@ -104,6 +107,10 @@ def _log_memory(prefix: str = ""):
         print(f"[VRAM]{prefix} allocated={allocated:.1f}MB reserved={reserved:.1f}MB")
     else:
         print("[VRAM] CUDA not available.")
+
+
+def _has_all_fim_tokens(prompt: str) -> bool:
+    return all(tok in prompt for tok in FIM_TOKENS)
 
 
 def _print_startup_info(
@@ -304,6 +311,29 @@ def _parse_args():
     )
     ap.add_argument("--seed", type=int, default=None, help="Optional seed override. Defaults to DEFAULT_SEED or SEED env.")
     ap.add_argument("--dry_run", action="store_true", help="Build model+data, run a few forward passes, then exit without saving.")
+    ap.add_argument(
+        "--dataset_format",
+        choices=["fim_native", "fim_expected_completed"],
+        default="fim_native",
+        help="Dataset format: 'fim_native' expects prompt+completion, 'fim_expected_completed' expects prompt+expectedCode(+completedCode).",
+    )
+    ap.add_argument(
+        "--require_fim_tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require all FIM tokens (<|fim_prefix|>, <|fim_suffix|>, <|fim_middle|>) in prompt.",
+    )
+    ap.add_argument(
+        "--keep_completed_code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep expectedCode/completedCode fields for analysis when using 'fim_expected_completed'.",
+    )
+    ap.add_argument(
+        "--encoding",
+        default="utf-8",
+        help="File encoding for JSONL datasets.",
+    )
     return ap.parse_args()
 
 
@@ -321,10 +351,78 @@ def _filter_truncatable(example, tokenizer, max_length: int) -> bool:
     return remaining_comp > 0
 
 
-def _prepare_datasets(tokenizer, train_path: str, val_path: str, max_length: int) -> DatasetDict:
-    ds = load_dataset("json", data_files={"train": train_path, "validation": val_path})
-    filtered = ds.filter(lambda ex: _filter_truncatable(ex, tokenizer, max_length))
-    return filtered
+def _prepare_datasets(
+    tokenizer,
+    train_path: str,
+    val_path: str,
+    max_length: int,
+    dataset_format: str,
+    require_fim_tokens: bool,
+    keep_completed_code: bool,
+    encoding: str,
+):
+    ds = load_dataset("json", data_files={"train": train_path, "validation": val_path}, encoding=encoding)
+    stats = {
+        "loaded": sum(len(ds[k]) for k in ds.keys()),
+        "dropped_missing": 0,
+        "dropped_fim": 0,
+        "file_sep": 0,
+    }
+
+    def _validate(example):
+        def _is_str(val):
+            return isinstance(val, str)
+
+        if dataset_format == "fim_expected_completed":
+            required = _is_str(example.get("prompt")) and _is_str(example.get("expectedCode")) and _is_str(
+                example.get("completedCode")
+            )
+        else:
+            required = _is_str(example.get("prompt")) and _is_str(example.get("completion"))
+        if not required:
+            stats["dropped_missing"] += 1
+            return False
+        if require_fim_tokens and not _has_all_fim_tokens(example["prompt"]):
+            stats["dropped_fim"] += 1
+            return False
+        if "<|file_sep|>" in example["prompt"]:
+            stats["file_sep"] += 1
+        return True
+
+    ds = ds.filter(_validate, load_from_cache_file=False)
+
+    if dataset_format == "fim_expected_completed":
+        keep_cols = {"prompt"}
+        if keep_completed_code:
+            keep_cols.update({"expectedCode", "completedCode"})
+        remove_columns = [c for c in ds["train"].column_names if c not in keep_cols]
+
+        def _map(example):
+            out = {"prompt": example["prompt"], "completion": example["expectedCode"]}
+            if keep_completed_code:
+                out["expectedCode"] = example["expectedCode"]
+                out["completedCode"] = example["completedCode"]
+            return out
+
+        ds = ds.map(_map, remove_columns=remove_columns, load_from_cache_file=False)
+
+    filtered = ds.filter(lambda ex: _filter_truncatable(ex, tokenizer, max_length), load_from_cache_file=False)
+    stats["kept"] = sum(len(filtered[k]) for k in filtered.keys())
+    return filtered, stats
+
+
+def _print_dataset_stats(stats: Dict, dataset_format: str):
+    print("==== Dataset summary ====")
+    print(f"dataset_format: {dataset_format}")
+    print(f"total_loaded: {stats.get('loaded', 0)}")
+    print(f"dropped_missing_or_type: {stats.get('dropped_missing', 0)}")
+    print(f"dropped_missing_fim_tokens: {stats.get('dropped_fim', 0)}")
+    kept = stats.get("kept", 0)
+    print(f"kept_after_filters: {kept}")
+    file_sep = stats.get("file_sep", 0)
+    ratio = (file_sep / kept * 100) if kept else 0.0
+    print(f"prompts_with_<|file_sep|>: {file_sep} ({ratio:.1f}%)")
+    print("=========================")
 
 
 def main():
@@ -378,7 +476,17 @@ def main():
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    datasets = _prepare_datasets(tokenizer, args.train, args.val, args.max_length)
+    datasets, ds_stats = _prepare_datasets(
+        tokenizer=tokenizer,
+        train_path=args.train,
+        val_path=args.val,
+        max_length=args.max_length,
+        dataset_format=args.dataset_format,
+        require_fim_tokens=args.require_fim_tokens,
+        keep_completed_code=args.keep_completed_code,
+        encoding=args.encoding,
+    )
+    _print_dataset_stats(ds_stats, args.dataset_format)
     collator = FIMLineCollator(tokenizer, max_length=args.max_length)
 
     steps_per_epoch = math.ceil(len(datasets["train"]) / (args.batch_size * args.grad_accum))

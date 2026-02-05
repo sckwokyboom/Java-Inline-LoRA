@@ -11,5 +11,7 @@ __pycache__/
 data/repos/
 data/train.jsonl
 data/val.jsonl
+data/converted_train.jsonl
+data/converted_val.jsonl
 reporeval_plots/
 adapters/
