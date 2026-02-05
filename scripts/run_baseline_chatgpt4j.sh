@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+
+# Fast baseline pipeline: clone chatgpt4j, build <=1000-sample dataset (no RAG), train a tiny LoRA.
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -7,35 +9,15 @@ export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# --- uv bootstrap (user-local, no sudo) ---
-if ! command -v uv >/dev/null 2>&1; then
-  echo "uv not found; installing to user environment..."
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  # ensure new shell can find uv (typical install path)
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
 VENV_PATH="${VENV_PATH:-.venv}"
-
-# Create/manage venv with uv (recommended) OR keep your python -m venv.
-# Using uv is more consistent:
-uv venv --path "${VENV_PATH}" >/dev/null
-
-# Activate venv (so 'python' points inside it for your scripts)
+if [ ! -d "${VENV_PATH}" ]; then
+  python3 -m venv "${VENV_PATH}"
+fi
 # shellcheck source=/dev/null
 source "${VENV_PATH}/bin/activate"
 
-# Sync dependencies from pyproject.toml (and uv.lock if present)
-# --frozen: fail if lock exists but doesn't match (good for reproducibility)
-# If you don't use uv.lock yet, you can drop --frozen.
-if [ -f "uv.lock" ]; then
-  uv sync --frozen
-else
-  uv sync
-fi
-
-# Install your package editable into the venv (so `import ...` works)
-uv pip install -e .
+# Install project dependencies (editable for local changes).
+pip install -e .
 
 DATA_REPOS_DIR="${REPO_ROOT}/data/repos"
 TARGET_REPO="${DATA_REPOS_DIR}/chatgpt4j"
@@ -60,6 +42,7 @@ python scripts/make_dataset.py \
   --out_train "${TRAIN_PATH}" \
   --out_val "${VAL_PATH}"
 
+# Cap datasets to <=1000 samples to keep the run lightweight.
 python - <<'PY'
 from itertools import islice
 from pathlib import Path
@@ -72,8 +55,8 @@ def cap(path: str, limit: int) -> None:
     if lines:
         p.write_text("".join(lines), encoding="utf-8")
 
-cap("data/chatgpt4j/train.jsonl", 1000)
-cap("data/chatgpt4j/val.jsonl", 1000)
+cap("data/train.jsonl", 1000)
+cap("data/val.jsonl", 1000)
 print("Trimmed train/val to at most 1000 samples each.")
 PY
 
