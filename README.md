@@ -49,13 +49,18 @@ python scripts/convert_dataset.py \
   --val data/val_3fields.jsonl \
   --dataset_format fim_expected_completed \
   --out_train data/converted_train.jsonl \
-  --out_val data/converted_val.jsonl
+  --out_val data/converted_val.jsonl \
+  --truncate_prompt_to_max_length \
+  --max_seq_length 2048 \
+  --truncate_policy drop_file_sep_prefix_then_left \
+  --truncate_report_path data/truncate_report.json
 ```
 
 Что делает команда:
 - проверяет, что `prompt`, `expectedCode`, `completedCode` — строки;
 - по умолчанию отбрасывает записи без всех FIM-токенов (`<|fim_prefix|>`, `<|fim_suffix|>`, `<|fim_middle|>`); снять проверку можно флагом `--no-require_fim_tokens`;
 - сохраняет `expectedCode` в поле `completion` (используется в лоссе), `completedCode` оставляет как метаданные (не участвует в лоссе);
+- при `--truncate_prompt_to_max_length` гарантирует, что `prompt+completion+eos` умещаются в `--max_seq_length`, сначала удаляя префиксные блоки `<|file_sep|>...<|file_sep|>`, затем левой обрезкой; если сохранить FIM-структуру нельзя — образец дропается с явной причиной;
 - пишет конвертированные файлы в указанные пути с `ensure_ascii=False`, китайские символы и `<|file_sep|>` сохраняются как есть.
 
 Быстрая проверка длин/токенов без записи файлов:
@@ -67,7 +72,10 @@ python scripts/convert_dataset.py \
   --dataset_format fim_expected_completed \
   --example_count 2 \
   --out_train "" \
-  --out_val ""
+  --out_val "" \
+  --truncate_prompt_to_max_length \
+  --max_seq_length 2048 \
+  --truncate_policy drop_file_sep_prefix_then_left
 ```
 
 ### 3. Создание датасета с RAG-контекстом (опционально)
