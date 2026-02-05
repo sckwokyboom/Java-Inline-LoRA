@@ -189,6 +189,59 @@ python scripts/make_dataset.py \
 - `rag_query`: текст запроса,
 - `rag_k_used`: сколько сниппетов реально вставлено (учитывая фильтры и лимиты).
 
+## Фильтрация датасета teacher-моделью (`/v1/completions`)
+
+Скрипт `scripts/filter_with_teacher.py` прогоняет FIM-образцы через teacher LLM и оставляет только те строки, где ответ teacher совпал с `completion` (режим сравнения настраивается).
+
+### Базовый детерминированный запуск
+
+```bash
+python scripts/filter_with_teacher.py \
+  --in data/train.jsonl \
+  --out data/train.filtered.teacher.jsonl \
+  --endpoint http://everest.nsu.ru:9111/v1 \
+  --model Qwen2.5-Coder-14B-GPTQ-Int4 \
+  --temperature 0 \
+  --top_p 1 \
+  --max_tokens 64 \
+  --stop "\n" \
+  --match_mode ws_norm \
+  --max_keep 1500
+```
+
+### С повышенной параллельностью
+
+```bash
+python scripts/filter_with_teacher.py \
+  --in data/train.jsonl \
+  --out data/train.filtered.teacher.jsonl \
+  --endpoint http://everest.nsu.ru:9111/v1 \
+  --model Qwen2.5-Coder-14B-GPTQ-Int4 \
+  --concurrency 16 \
+  --qps 8 \
+  --request_timeout 60 \
+  --max_retries 5 \
+  --retry_backoff_base 0.5
+```
+
+### С файлом отклонённых примеров
+
+```bash
+python scripts/filter_with_teacher.py \
+  --in data/train.jsonl \
+  --out data/train.filtered.teacher.jsonl \
+  --rejected_out data/train.rejected.teacher.jsonl \
+  --endpoint http://everest.nsu.ru:9111/v1 \
+  --model Qwen2.5-Coder-14B-GPTQ-Int4 \
+  --match_mode trimmed
+```
+
+Что пишет скрипт:
+- в `--out` попадают только `teacher_filter.passed == true`;
+- в `--rejected_out` (если задан) — mismatch/ошибки с метаданными `teacher_filter`;
+- рядом с `--out` создаётся `*.run_manifest.json` (время запуска, аргументы, git commit, статистика);
+- прогресс печатается каждые `--progress_every` обработанных образцов (по умолчанию 50).
+
 ## Обучение модели
 
 Быстрый тест без сохранения артефактов (строит модель+датасет, делает пару проходов вперёд и печатает VRAM):
