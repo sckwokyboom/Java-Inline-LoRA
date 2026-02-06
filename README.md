@@ -191,7 +191,7 @@ python scripts/make_dataset.py \
 
 ## Фильтрация датасета teacher-моделью (`/v1/completions`)
 
-Скрипт `scripts/filter_with_teacher.py` прогоняет FIM-образцы через teacher LLM и оставляет только те строки, где ответ teacher совпал с `completion` (режим сравнения настраивается).
+Скрипт `scripts/filter_with_teacher.py` прогоняет FIM-образцы через teacher LLM и оставляет только те строки, где ответ teacher совпал с `completion` (режим сравнения настраивается). По умолчанию лимитов нет: обрабатывается весь вход, если не заданы `--max_keep`/`--max_samples`.
 
 ### Базовый детерминированный запуск
 
@@ -205,8 +205,7 @@ python scripts/filter_with_teacher.py \
   --top_p 1 \
   --max_tokens 64 \
   --stop "\n" \
-  --match_mode ws_norm \
-  --max_keep 1500
+  --match_mode ws_norm
 ```
 
 ### С повышенной параллельностью
@@ -234,6 +233,26 @@ python scripts/filter_with_teacher.py \
   --endpoint http://everest.nsu.ru:9111/v1 \
   --model Qwen2.5-Coder-14B-GPTQ-Int4 \
   --match_mode trimmed
+```
+
+### Ограничение количества (опционально)
+
+```bash
+# Остановиться после 20000 сохранённых примеров
+python scripts/filter_with_teacher.py \
+  --in data/train.jsonl \
+  --out data/train.filtered.teacher.jsonl \
+  --endpoint http://everest.nsu.ru:9111/v1 \
+  --model Qwen2.5-Coder-14B-GPTQ-Int4 \
+  --max_keep 20000
+
+# Обработать только первые 50000 входных примеров
+python scripts/filter_with_teacher.py \
+  --in data/train.jsonl \
+  --out data/train.filtered.teacher.jsonl \
+  --endpoint http://everest.nsu.ru:9111/v1 \
+  --model Qwen2.5-Coder-14B-GPTQ-Int4 \
+  --max_samples 50000
 ```
 
 Что пишет скрипт:

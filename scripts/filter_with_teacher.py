@@ -232,13 +232,29 @@ def iter_jsonl(path: Path) -> Iterable[dict]:
 
 
 def limited_samples(samples: Iterable[dict], max_samples: Optional[int]) -> Iterable[dict]:
-    if max_samples is None:
+    if max_samples is None or max_samples <= 0:
         yield from samples
         return
     for idx, sample in enumerate(samples):
         if idx >= max_samples:
             break
         yield sample
+
+
+def reservoir_sample(samples: Iterable[dict], max_samples: int, seed: int) -> list[dict]:
+    if max_samples <= 0:
+        return []
+    rnd = random.Random(seed)
+    reservoir: list[dict] = []
+    for idx, sample in enumerate(samples):
+        if idx < max_samples:
+            reservoir.append(sample)
+            continue
+        j = rnd.randint(0, idx)
+        if j < max_samples:
+            reservoir[j] = sample
+    rnd.shuffle(reservoir)
+    return reservoir
 
 
 def normalize_line_endings(text: str) -> str:
@@ -497,11 +513,14 @@ def load_samples(input_path: Path, shuffle: bool, seed: int, max_samples: Option
     if not shuffle:
         return limited_samples(raw_iter, max_samples)
 
+    if max_samples is not None and max_samples > 0:
+        # Use reservoir sampling to avoid loading the full dataset into memory.
+        return reservoir_sample(raw_iter, max_samples, seed)
+
+    print("[warn] --shuffle enabled without --max_samples; loading full input into memory")
     all_samples = list(raw_iter)
     rnd = random.Random(seed)
     rnd.shuffle(all_samples)
-    if max_samples is not None:
-        all_samples = all_samples[:max_samples]
     return all_samples
 
 
@@ -525,6 +544,11 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
     else:
         max_keep = args.max_keep
 
+    if args.max_samples is not None and args.max_samples <= 0:
+        max_samples = None
+    else:
+        max_samples = args.max_samples
+
     generation_params: dict[str, Any] = {
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
@@ -547,7 +571,7 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
         qps_limiter=limiter,
     )
 
-    samples_iter = iter(load_samples(input_path, args.shuffle, args.seed, args.max_samples))
+    samples_iter = iter(load_samples(input_path, args.shuffle, args.seed, max_samples))
 
     processed = 0
     kept = 0
@@ -560,6 +584,7 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
 
     start_ts = now_utc_iso()
     reached_max_keep = False
+    reached_max_samples = False
 
     with open_text(out_path, "wt") as out_f:
         if rejected_path is not None:
@@ -653,10 +678,15 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
                             if args.progress_every > 0 and processed % args.progress_every == 0:
                                 keep_rate = (kept / processed) if processed else 0.0
                                 avg_latency = (latency_sum / latency_count) if latency_count else 0.0
+                                input_submitted_display = (
+                                    f"{in_count}/{max_samples}" if max_samples is not None else f"{in_count}"
+                                )
+                                kept_display = f"{kept}/{max_keep}" if max_keep is not None else f"{kept}"
                                 print(
                                     "[progress] "
                                     f"processed={processed} "
-                                    f"kept={kept} "
+                                    f"input_submitted={input_submitted_display} "
+                                    f"kept={kept_display} "
                                     f"rejected={rejected} "
                                     f"errors={errors} "
                                     f"keep_rate={keep_rate:.4f} "
@@ -679,14 +709,19 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
 
     print("[summary]")
     print(f"  processed={processed}")
-    print(f"  input_submitted={in_count}")
-    print(f"  kept={kept}")
+    input_submitted_display = f"{in_count}/{max_samples}" if max_samples is not None else f"{in_count}"
+    kept_display = f"{kept}/{max_keep}" if max_keep is not None else f"{kept}"
+    print(f"  input_submitted={input_submitted_display}")
+    print(f"  kept={kept_display}")
     print(f"  rejected={rejected}")
     print(f"  errors={errors}")
     print(f"  keep_rate={keep_rate:.4f}")
     print(f"  avg_latency_ms={avg_latency:.1f}")
     if reached_max_keep:
         print(f"  stopped_early=max_keep({max_keep}) reached")
+    if max_samples is not None and in_count >= max_samples:
+        reached_max_samples = True
+        print(f"  stopped_early=max_samples({max_samples}) reached")
 
     print("[failure_reasons]")
     for reason, cnt in reasons.most_common():
@@ -703,6 +738,7 @@ def run_filter(args: argparse.Namespace) -> dict[str, Any]:
         "avg_latency_ms": avg_latency,
         "failure_reasons": dict(reasons),
         "stopped_early_max_keep": reached_max_keep,
+        "stopped_early_max_samples": reached_max_samples,
     }
     manifest_path = write_manifest(out_path, args, start_ts=start_ts, end_ts=end_ts, stats=stats)
     print(f"[manifest] wrote {manifest_path}")
@@ -725,8 +761,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True, help="Model name used by the teacher endpoint")
 
     p.add_argument("--rejected_out", default=None, help="Optional JSONL(.gz) path for rejected/errored samples")
-    p.add_argument("--max_keep", type=int, default=1500, help="Stop after this many kept samples; <=0 means no limit")
-    p.add_argument("--max_samples", type=int, default=None, help="Maximum input samples to process")
+    p.add_argument(
+        "--max_keep",
+        type=int,
+        default=None,
+        help="Stop after this many kept samples. Omit for no limit. <=0 means no limit.",
+    )
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Maximum input samples to process. Omit for no limit. <=0 means no limit.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for --shuffle")
     p.add_argument("--shuffle", action="store_true", help="Shuffle input sample order before processing")
     p.add_argument("--request_timeout", type=float, default=60.0, help="Request timeout in seconds")
