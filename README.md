@@ -189,6 +189,64 @@ python scripts/make_dataset.py \
 - `rag_query`: текст запроса,
 - `rag_k_used`: сколько сниппетов реально вставлено (учитывая фильтры и лимиты).
 
+## Codefixes dataset + training (`/v1/chat/completions`)
+
+Для задачи исправления ошибки в одной Java-строке добавлен отдельный изолированный пайплайн:
+- `scripts/make_codefix_dataset.py` — генерация синтетических train/val сэмплов;
+- `scripts/train_codefix_lora.py` — обучение отдельного LoRA-адаптера.
+
+Существующие скрипты inline completion (`make_dataset.py`, `train_lora.py`, `convert_dataset.py`) не затрагиваются.
+
+### Генерация 5000 codefix-сэмплов (4900/100, split-by-file)
+
+```bash
+python scripts/make_codefix_dataset.py \
+  --repo ./data/repos/chatgpt4j \
+  --target_total 5000 \
+  --val_count 100 \
+  --bm25_top_k 4 \
+  --out_train data/codefix_train.jsonl \
+  --out_val data/codefix_val.jsonl
+```
+
+Что делает скрипт:
+- ищет одно-строчные Java statement-вызовы вида `...(...);`;
+- синтетически портит строку одной ошибкой (`swap_args`, `missing_arg`, `extra_arg`);
+- подбирает BM25-похожие корректные statement-строки (augmentations);
+- формирует prompt в chat-формате (`system` + `user`) и `completion` как строго один ` ```java `-блок с исправленной строкой;
+- собирает ровно `target_total` записей с fail-fast при нехватке кандидатов.
+
+Формат строки JSONL:
+- `prompt`, `completion`, `messages`;
+- `mutation_type`, `original_line`, `broken_line`;
+- `compiler_problems`, `augmentations`;
+- `file`, `line_index`, `id`.
+
+### Обучение отдельного LoRA-адаптера для codefix
+
+```bash
+python scripts/train_codefix_lora.py \
+  --model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --train data/codefix_train.jsonl \
+  --val data/codefix_val.jsonl \
+  --out adapters/codefix-qwen25coder7b-bf16-lora \
+  --dtype bf16 \
+  --max_length 2048 \
+  --epochs 1 \
+  --batch_size 1 \
+  --grad_accum 16
+```
+
+Быстрый smoke-check без сохранения адаптера:
+
+```bash
+python scripts/train_codefix_lora.py \
+  --train data/codefix_train.jsonl \
+  --val data/codefix_val.jsonl \
+  --out adapters/codefix-debug \
+  --dry_run
+```
+
 ## Фильтрация датасета teacher-моделью (`/v1/completions`)
 
 Скрипт `scripts/filter_with_teacher.py` прогоняет FIM-образцы через teacher LLM и оставляет только те строки, где ответ teacher совпал с `completion` (режим сравнения настраивается). По умолчанию лимитов нет: обрабатывается весь вход, если не заданы `--max_keep`/`--max_samples`.
